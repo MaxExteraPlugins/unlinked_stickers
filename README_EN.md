@@ -21,7 +21,7 @@
 
 **Unlinked Stickers** plugin for **exteraGram** and **AyuGram** clients.
 
-Send stickers from any pack as detached standalone files, unlinked from the original set.
+Send stickers detached from sticker packs and hide unwanted metadata.
 
 ---
 
