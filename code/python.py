@@ -8,7 +8,7 @@ from typing import Any, Optional
 from java import jclass
 from java.util import Locale
 
-from org.telegram.messenger import ApplicationLoader, FileLoader, MessageObject, UserConfig
+from org.telegram.messenger import ApplicationLoader, FileLoader, MessageObject, SendMessagesHelper, UserConfig
 from org.telegram.tgnet import TLRPC
 
 from base_plugin import BasePlugin, MethodHook
@@ -21,7 +21,7 @@ __id__          = "unlinked_stickers"
 __name__        = "Unlinked Stickers"
 __description__ = "Send stickers from any pack as your own uploaded documents, detached from the original sticker set. \n\nIdea's author: @mishabotov"
 __author__      = "@itNotMax - @MaxExteraPlugins"
-__version__ = "1.4.2"
+__version__ = "1.4.3"
 __icon__        = "MaxExteraPluginsStickers/26"
 __min_version__ = "12.10.6"
 __app_version__ = ">=12.10.6"
@@ -899,6 +899,7 @@ class UnlinkedStickersPlugin(BasePlugin):
         self._hook_refs              = []
         self._download_request_times = {}
         self._notify_times           = {}
+        self._waiting_downloads      = set()   # doc_ids ожидающих загрузки
         self.dex                     = Dex(ENTRY_CLASS)
 
     # ------------------------------------------------------------------
@@ -923,6 +924,7 @@ class UnlinkedStickersPlugin(BasePlugin):
         self._hook_refs.clear()
         self._download_request_times.clear()
         self._notify_times.clear()
+        self._waiting_downloads.clear()
         try:
             self.dex.unload()
         except Exception:
@@ -1058,8 +1060,20 @@ class UnlinkedStickersPlugin(BasePlugin):
         account    = self._resolve_account(send_helper)
         local_file = self._find_existing_sticker_file(account, document)
         if local_file is None:
-            self._request_download_if_needed(account, document, getattr(send_params, "parentObject", None))
-            self._notify_once(doc_id, _t("downloading"), is_error=False)
+            # Запускаем загрузку и фоновый поток, который сам отправит после скачивания
+            if doc_id not in self._waiting_downloads:
+                self._waiting_downloads.add(doc_id)
+                parent_object = getattr(send_params, "parentObject", None)
+                try:
+                    FileLoader.getInstance(int(account)).loadFile(document, parent_object, 3, 0)
+                except Exception:
+                    pass
+                threading.Thread(
+                    target=self._wait_and_send,
+                    args=(account, document, send_params, send_helper, doc_id),
+                    daemon=True,
+                    name="UnlinkedStickers-wait",
+                ).start()
             return "cancel"
 
         try:
@@ -1077,6 +1091,10 @@ class UnlinkedStickersPlugin(BasePlugin):
     # ------------------------------------------------------------------
 
     def _looks_like_sticker(self, document: Any) -> bool:
+        # Быстрая проверка mime: GIF/видео/аудио/фото не трогаем до вызова Java
+        mime = str(getattr(document, "mime_type", "") or "")
+        if mime and mime not in ("image/webp", "application/x-tgsticker", "video/webm"):
+            return False
         try:
             return bool(
                 MessageObject.isStickerDocument(document)
@@ -1084,7 +1102,6 @@ class UnlinkedStickersPlugin(BasePlugin):
                 or MessageObject.isVideoSticker(document)
             )
         except Exception:
-            mime = str(getattr(document, "mime_type", "") or "")
             return mime in ("image/webp", "application/x-tgsticker", "video/webm")
 
     def _get_sticker_attribute(self, document: Any) -> Any:
@@ -1117,6 +1134,38 @@ class UnlinkedStickersPlugin(BasePlugin):
             return sticker_set is None or isinstance(sticker_set, TLRPC.TL_inputStickerSetEmpty)
         except Exception:
             return False
+
+    # ------------------------------------------------------------------
+    # Auto-send after download
+    # ------------------------------------------------------------------
+
+    def _wait_and_send(self, account: int, document: Any, send_params: Any, send_helper: Any, doc_id: int) -> None:
+        """Ждёт появления файла на диске (до 60 с), затем клонирует и отправляет."""
+        try:
+            deadline = time.time() + 60.0
+            while time.time() < deadline:
+                time.sleep(0.5)
+                if not self.enabled:
+                    return
+                local_file = self._find_existing_sticker_file(account, document)
+                if local_file is not None:
+                    try:
+                        anon_doc = self._clone_document_for_upload(document, local_file)
+                        setattr(send_params, "document", anon_doc)
+                        setattr(send_params, "path",     local_file.getAbsolutePath())
+                        self._strip_runtime_pack_hints(send_params)
+                        # Повторный вызов sendMessage; хук определит документ как уже анонимный
+                        # (_is_already_anonymous_upload → True) и пропустит без изменений
+                        SendMessagesHelper.getInstance(int(account)).sendMessage(send_params)
+                    except Exception as e:
+                        self.log("[UnlinkedStickers] wait_and_send error: " + str(e))
+                        self._show_error(_t("anonymize_failed"))
+                    return
+            # Таймаут — стикер так и не скачался
+            self.log("[UnlinkedStickers] download timeout for doc_id=" + str(doc_id))
+            self._show_error(_t("anonymize_failed"))
+        finally:
+            self._waiting_downloads.discard(doc_id)
 
     # ------------------------------------------------------------------
     # File access helpers
