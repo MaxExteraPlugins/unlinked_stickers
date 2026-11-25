@@ -38,4 +38,4 @@ Send stickers detached from sticker packs and hide unwanted metadata.
 
 * **exteraGram:** `>= 12.10.6`
 * **AyuGram:** `>= 12.10.6`
-* **Plugin SDK:** `>= 1.4.3.3`
+* **Plugin SDK:** `>= 1.4.4.3`
