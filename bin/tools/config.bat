@@ -38,7 +38,10 @@ if not defined EX_SDK_ROOT if defined ANDROID_HOME set "EX_SDK_ROOT=%ANDROID_HOM
 if not defined EX_SDK_ROOT if exist "%LOCALAPPDATA%\Android\Sdk" set "EX_SDK_ROOT=%LOCALAPPDATA%\Android\Sdk"
 if defined EX_SDK_ROOT (
     if exist "%EX_SDK_ROOT%\build-tools" (
-        for /f "delims=" %%d in ('dir /b /ad /on "%EX_SDK_ROOT%\build-tools" 2^>nul') do set "EX_BUILD_TOOLS=%%d"
+        for /f "usebackq delims=" %%d in (`python -c "import os,re;bt=os.listdir(os.path.join(os.environ['EX_SDK_ROOT'],'build-tools'));print(max(bt,key=lambda s:[int(x) if x.isdigit() else -1 for x in re.split(r'[^0-9]+',s)])) if bt else ''" 2^>nul`) do set "EX_BUILD_TOOLS=%%d"
+        if not defined EX_BUILD_TOOLS (
+            for /f "delims=" %%d in ('dir /b /ad /on "%EX_SDK_ROOT%\build-tools" 2^>nul') do set "EX_BUILD_TOOLS=%%d"
+        )
     )
 )
 if defined EX_BUILD_TOOLS set "EX_D8=%EX_SDK_ROOT%\build-tools\%EX_BUILD_TOOLS%\d8.bat"

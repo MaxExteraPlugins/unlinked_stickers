@@ -7,13 +7,13 @@ chcp 65001 >nul 2>&1
 :: Usage:  tools\build_core.bat <project_dir>
 ::
 :: Reads  <project_dir>\versions.txt   (per-fork version list)
-:: Uses   <project_dir>\bin\classes\<fork>\<version>\*.jar
-::         + <project_dir>\bin\android.jar
+:: Uses   PluginSystem\temp\classes\<fork>\<version>\*.jar
+::        + PluginSystem\data\android.jar
+::        (falls back to <project_dir>\bin\ for standalone use)
 ::
-:: 1. Compiles plugin sources against each version's classes
-:: 2. Converts to DEX (d8), base64+zlib encodes
-:: 3. Injects payload into code\python.py
-:: 4. Writes <plugin_id>.plugin
+:: 1. Compiles plugin sources against each (fork, version)
+:: 2. Converts lowest-version classes to DEX (d8), base64+zlib
+:: 3. Injects _DEX_PAYLOAD into <plugin_id>.plugin & validates AST
 :: ============================================================
 
 set "TOOLS_DIR=%~dp0"
@@ -42,23 +42,24 @@ set "PYTHON_SRC=%CODE_DIR%\python.py"
 set "VERSIONS_FILE=%PROJECT_DIR%versions.txt"
 set "TEMP_DIR=%PROJECT_DIR%temp_build"
 
-:: Override ANDROID_JAR to project-local
+:: Prefer shared PluginSystem root resources if inside PluginSystem\projects\<id>\
+set "CLASSES_ROOT=%BIN_DIR%\classes"
 set "ANDROID_JAR=%BIN_DIR%\android.jar"
+for %%i in ("%PROJECT_DIR%..\..") do set "MAYBE_ROOT=%%~fi"
+if exist "%MAYBE_ROOT%\temp\classes" set "CLASSES_ROOT=%MAYBE_ROOT%\temp\classes"
+if exist "%MAYBE_ROOT%\data\android.jar" set "ANDROID_JAR=%MAYBE_ROOT%\data\android.jar"
 
 :: ---------------- validate tools ----------------
 if not defined EX_JAVAC (
     echo ERROR: javac not found. Install Android Studio or set JAVA_HOME.
-    pause
     exit /b 1
 )
 if not defined EX_D8 (
     echo ERROR: d8 not found. Install Android build-tools.
-    pause
     exit /b 1
 )
 if not exist "%ANDROID_JAR%" (
-    echo ERROR: android.jar not found in bin\
-    pause
+    echo ERROR: android.jar not found: %ANDROID_JAR%
     exit /b 1
 )
 
@@ -66,35 +67,36 @@ set "JAVA_FOLDER=0"
 for /r "%CODE_DIR%\java" %%f in (*.java) do set "JAVA_FOLDER=1"
 
 if not exist "%JAVA_SRC%" if "!JAVA_FOLDER!"=="0" (
-    echo ERROR: Java source not found: %JAVA_SRC% (or code\java\ folder^)
-    pause
+    echo ERROR: Java source not found: %JAVA_SRC% ^(or code\java\ folder^)
     exit /b 1
 )
 if not exist "%PYTHON_SRC%" (
     echo ERROR: Python source not found: %PYTHON_SRC%
-    pause
     exit /b 1
 )
 if not exist "%VERSIONS_FILE%" (
     echo ERROR: versions.txt not found in project. Re-run create.bat.
-    pause
     exit /b 1
 )
 
-:: ---------------- collect all versions from all forks ----------------
-set VER_LIST=
+:: ---------------- collect (fork, version) pairs from versions.txt ----------------
+set "TARGET_LIST="
+set "CUR_FORK="
 for /f "usebackq delims=" %%l in ("%VERSIONS_FILE%") do (
     set "LINE=%%l"
     if not "!LINE!"=="" (
         set "CH=!LINE:~0,1!"
         if "!CH!"==" " (
-            for %%v in (!LINE!) do set "VER_LIST=!VER_LIST! %%v"
+            for %%v in (!LINE!) do (
+                if defined CUR_FORK set "TARGET_LIST=!TARGET_LIST! !CUR_FORK!:%%v"
+            )
+        ) else (
+            for %%f in (!LINE!) do set "CUR_FORK=%%f"
         )
     )
 )
-if not defined VER_LIST (
+if not defined TARGET_LIST (
     echo ERROR: versions.txt is empty. Re-run create.bat.
-    pause
     exit /b 1
 )
 
@@ -103,21 +105,15 @@ echo ================================================
 echo   ETG PluginSystem Plugin Builder
 echo ================================================
 echo   Project : %PROJECT_DIR%
-echo   Versions:%VER_LIST%
+echo   Classes : %CLASSES_ROOT%
+echo   Targets :%TARGET_LIST%
 echo.
 
-:: ---------------- extract plugin id from python ----------------
-set "PLUGIN_ID="
-for /f "tokens=2 delims==" %%a in ('findstr /r "^__id__" "%PYTHON_SRC%" 2^>nul') do (
-    set "RAW=%%a"
-    set "RAW=!RAW: =!"
-    set "RAW=!RAW:"=!"
-    set "RAW=!RAW:'=!"
-    set "PLUGIN_ID=!RAW!"
-)
+:: ---------------- extract plugin id from python (via AST) ----------------
+set "PS_PY=%PYTHON_SRC%"
+for /f "usebackq delims=" %%i in (`python -c "import ast,os;t=ast.parse(open(os.environ['PS_PY'],encoding='utf-8').read());v=[ast.literal_eval(n.value) for n in t.body if isinstance(n,ast.Assign) and any(isinstance(x,ast.Name) and x.id=='__id__' for x in n.targets)];print(v[0] if v else '')" 2^>nul`) do set "PLUGIN_ID=%%i"
 if "%PLUGIN_ID%"=="" (
     echo ERROR: Could not extract __id__ from %PYTHON_SRC%
-    pause
     exit /b 1
 )
 echo   Plugin ID: %PLUGIN_ID%
@@ -136,15 +132,12 @@ if "!JAVA_FOLDER!"=="1" (
 )
 if "%PACKAGE%"=="" (
     echo ERROR: Could not find package declaration in the java sources
-    pause
     exit /b 1
 )
 
 set "CLASS_NAME="
-for /f "tokens=3 delims= " %%c in ('findstr /r /c:"^public class " "%CODE_DIR%\java\Main.java" 2^>nul') do set "CLASS_NAME=%%c"
-if not defined CLASS_NAME (
-    for /f "tokens=3 delims= " %%c in ('findstr /r /c:"^public class " "%JAVA_SRC%" 2^>nul') do set "CLASS_NAME=%%c"
-)
+set "PS_CODE=%CODE_DIR%"
+for /f "usebackq delims=" %%c in (`python -c "import os,re;cd=os.environ['PS_CODE'];p=os.path.join(cd,'java','Main.java');p=p if os.path.exists(p) else os.path.join(cd,'java.java');txt=open(p,encoding='utf-8',errors='ignore').read() if os.path.exists(p) else '';m=re.search(r'^\s*public\s+(?:final\s+|abstract\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)',txt,re.M);print(m.group(1) if m else 'Main')" 2^>nul`) do set "CLASS_NAME=%%c"
 if not defined CLASS_NAME set "CLASS_NAME=Main"
 
 set "PACKAGE_DIR=%PACKAGE:.=\%"
@@ -167,46 +160,48 @@ for /r "%TEMP_DIR%\src" %%f in (*.java) do set "SRC_ARG=!SRC_ARG! "%%f""
 if not defined SRC_ARG (
     echo ERROR: no java sources found in the project
     rmdir /s /q "%TEMP_DIR%" 2>nul
-    pause
     exit /b 1
 )
 
 :: ============================================================
-:: STEP 1: per-version compatibility check
+:: STEP 1: per-(fork, version) compatibility check
 :: ============================================================
-echo [1/5] Compatibility check (compiling against each version)...
+echo [1/5] Compatibility check (compiling against each target)...
 echo.
 
-set COMPAT_OK=1
+set "COMPAT_OK=1"
+set "DEX_SRC="
 
-for %%v in (%VER_LIST%) do call :check_version %%v
+for %%t in (%TARGET_LIST%) do (
+    for /f "tokens=1,2 delims=:" %%a in ("%%t") do call :check_target %%a %%b
+)
 
 echo.
 
 if not "%COMPAT_OK%"=="1" (
     echo ================================================
-    echo   BUILD FAILED: not compatible with all versions!
+    echo   BUILD FAILED: not compatible with all targets!
     echo ================================================
-    for %%v in (%VER_LIST%) do (
-        if exist "%TEMP_DIR%\javac_err_%%v.txt" (
-            for %%s in ("%TEMP_DIR%\javac_err_%%v.txt") do set "ERR_SIZE=%%~zs"
-            if not "!ERR_SIZE!"=="0" (
-                echo.
-                echo   Errors for version %%v:
-                for /f "delims=" %%e in ('type "%TEMP_DIR%\javac_err_%%v.txt"') do echo     %%e
+    for %%t in (%TARGET_LIST%) do (
+        for /f "tokens=1,2 delims=:" %%a in ("%%t") do (
+            if exist "%TEMP_DIR%\javac_err_%%a_%%b.txt" (
+                for %%s in ("%TEMP_DIR%\javac_err_%%a_%%b.txt") do set "ERR_SIZE=%%~zs"
+                if not "!ERR_SIZE!"=="0" (
+                    echo.
+                    echo   Errors for %%a %%b:
+                    for /f "delims=" %%e in ('type "%TEMP_DIR%\javac_err_%%a_%%b.txt"') do echo     %%e
+                )
             )
         )
     )
     rmdir /s /q "%TEMP_DIR%" 2>nul
-    pause
     exit /b 1
 )
 
 :: ============================================================
-:: STEP 2: convert compiled classes to DEX
+:: STEP 2: convert compiled classes (lowest target) to DEX
 :: ============================================================
-echo [2/5] Converting to DEX...
-set "DEX_SRC=%TEMP_DIR%\compile_%LAST_GOOD_VER%"
+echo [2/5] Converting to DEX (from %DEX_SRC_LABEL%)...
 
 set "JAR_EXE=%EX_JBR%\bin\jar.exe"
 if not exist "%JAR_EXE%" set "JAR_EXE=jar"
@@ -215,44 +210,40 @@ call "%EX_D8%" --lib "%ANDROID_JAR%" --output "%TEMP_DIR%" "%TEMP_DIR%\classes.j
 if errorlevel 1 (
     echo ERROR: d8 conversion failed
     rmdir /s /q "%TEMP_DIR%" 2>nul
-    pause
     exit /b 1
 )
 if not exist "%TEMP_DIR%\classes.dex" (
     echo ERROR: classes.dex was not created
     rmdir /s /q "%TEMP_DIR%" 2>nul
-    pause
     exit /b 1
 )
 echo        DEX created successfully
 
 :: ============================================================
-:: STEP 3: encode DEX to base64+zlib
+:: STEP 3: encode DEX to base64+zlib Python variable
 :: ============================================================
 echo [3/5] Encoding DEX to base64...
-set "TEMP_FWD=%TEMP_DIR:\=/%"
-set "PY_FWD=%PYTHON_SRC:\=/%"
-python -c "import base64,zlib;dex=open('%TEMP_FWD%/classes.dex','rb').read();enc=base64.b64encode(zlib.compress(dex,9)).decode();lines=['# '+enc[i:i+76] for i in range(0,len(enc),76)];open('%TEMP_FWD%/dex_payload.txt','w').write('\n'.join(lines))"
+set "PS_TEMP=%TEMP_DIR%"
+set "PS_OUT=%PROJECT_DIR%%PLUGIN_ID%.plugin"
+python -c "import base64,zlib,os;td=os.environ['PS_TEMP'];dex=open(os.path.join(td,'classes.dex'),'rb').read();enc=base64.b64encode(zlib.compress(dex,9)).decode();lines=['    \"'+enc[i:i+72]+'\"' for i in range(0,len(enc),72)];body='_DEX_PAYLOAD = (\n'+'\n'.join(lines)+'\n)' if lines else '_DEX_PAYLOAD = \"\"';open(os.path.join(td,'dex_payload.txt'),'w',encoding='utf-8').write(body)"
 if errorlevel 1 (
     echo ERROR: base64 encoding failed - is python installed?
     rmdir /s /q "%TEMP_DIR%" 2>nul
-    pause
     exit /b 1
 )
 echo        Encoding successful
 
 :: ============================================================
-:: STEP 4: assemble plugin file
+:: STEP 4: assemble & validate plugin file
 :: ============================================================
-echo [4/5] Assembling plugin file...
-python -c "py=open('%PY_FWD%','r',encoding='utf-8').read();parts=py.split('# __DEX_BEGIN__');before=parts[0];after=parts[1].split('# __DEX_END__')[1];payload=open('%TEMP_FWD%/dex_payload.txt','r').read();open('%PROJECT_DIR:\=/%%PLUGIN_ID%.plugin','w',encoding='utf-8').write(before+'# __DEX_BEGIN__\n'+payload+'\n# __DEX_END__'+after)"
+echo [4/5] Assembling and validating plugin file...
+python -c "import ast,os;td=os.environ['PS_TEMP'];py=open(os.environ['PS_PY'],'r',encoding='utf-8').read();b='# __DEX_BEGIN__';e='# __DEX_END__';assert b in py and e in py,'Missing DEX markers in python.py';before,rest=py.split(b,1);_,after=rest.split(e,1);payload=open(os.path.join(td,'dex_payload.txt'),'r',encoding='utf-8').read();out_text=before+b+'\n'+payload+'\n'+e+after;ast.parse(out_text);open(os.environ['PS_OUT'],'w',encoding='utf-8').write(out_text)"
 if errorlevel 1 (
-    echo ERROR: plugin assembly failed
+    echo ERROR: plugin assembly or AST validation failed
     rmdir /s /q "%TEMP_DIR%" 2>nul
-    pause
     exit /b 1
 )
-echo        Assembly successful
+echo        Assembly and AST check passed
 
 :: ============================================================
 :: STEP 5: cleanup
@@ -275,37 +266,38 @@ endlocal
 exit /b 0
 
 :: ============================================================
-:: :check_version <version>
-:: Compiles plugin source against one version's classes.
+:: :check_target <fork> <version>
+:: Compiles plugin source against one fork+version's classes.
 :: ============================================================
-:check_version
-set "VER=%~1"
+:check_target
+set "FORK=%~1"
+set "VER=%~2"
 set "VER_CP=%ANDROID_JAR%"
 
-:: Search for classes across all forks
-for /d %%f in ("%BIN_DIR%\classes\*") do (
-    if exist "%BIN_DIR%\classes\%%~nxf\%VER%\" (
-        for %%j in ("%BIN_DIR%\classes\%%~nxf\%VER%\*.jar") do (
-            if "!VER_CP!"=="" ( set "VER_CP=%%j" ) else ( set "VER_CP=!VER_CP!;%%j" )
-        )
+if exist "%CLASSES_ROOT%\%FORK%\%VER%\" (
+    for %%j in ("%CLASSES_ROOT%\%FORK%\%VER%\*.jar") do (
+        set "VER_CP=!VER_CP!;%%j"
     )
 )
 
 if "!VER_CP!"=="%ANDROID_JAR%" (
-    echo   [%VER%] SKIP - no classes extracted. Run create.bat again.
-    set COMPAT_OK=0
+    echo   [%FORK% %VER%] SKIP - no classes found in %CLASSES_ROOT%\%FORK%\%VER%
+    set "COMPAT_OK=0"
     exit /b 0
 )
 
-set "OUT_DIR=%TEMP_DIR%\compile_%VER%"
+set "OUT_DIR=%TEMP_DIR%\compile_%FORK%_%VER%"
 mkdir "!OUT_DIR!" 2>nul
 
-"%EX_JAVAC%" -source 1.8 -target 1.8 -Xlint:-options -Xlint:deprecation -d "!OUT_DIR!" -cp "!VER_CP!" %SRC_ARG% 2>"%TEMP_DIR%\javac_err_%VER%.txt"
+"%EX_JAVAC%" -source 1.8 -target 1.8 -Xlint:-options -Xlint:deprecation -d "!OUT_DIR!" -cp "!VER_CP!" %SRC_ARG% 2>"%TEMP_DIR%\javac_err_%FORK%_%VER%.txt"
 if errorlevel 1 (
-    echo   [%VER%] FAILED - incompatible or missing classes
-    set COMPAT_OK=0
+    echo   [%FORK% %VER%] FAILED - incompatible or missing classes
+    set "COMPAT_OK=0"
 ) else (
-    echo   [%VER%] OK
-    set "LAST_GOOD_VER=%VER%"
+    echo   [%FORK% %VER%] OK
+    if not defined DEX_SRC (
+        set "DEX_SRC=!OUT_DIR!"
+        set "DEX_SRC_LABEL=%FORK% %VER%"
+    )
 )
 exit /b 0

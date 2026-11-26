@@ -114,6 +114,10 @@ class Dex:
         return None
 
     def _rp(self):
+        _dex_b64 = globals().get("_DEX_PAYLOAD")
+        if _dex_b64:
+            import base64, zlib
+            return zlib.decompress(base64.b64decode(_dex_b64))
         with open(__file__, "r", encoding="utf-8") as f:
             t = f.read()
         if "# " + DEX_BEGIN not in t or "# " + DEX_END not in t:

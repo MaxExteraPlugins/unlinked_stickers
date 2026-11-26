@@ -97,17 +97,11 @@ echo Preparing classes...
 call :extract_all
 echo.
 
-:: ---------------- update project bin ----------------
-echo Updating project bin...
+:: ---------------- update project ----------------
+echo Updating project versions...
 
-if exist "%PS_ROOT%\data\android.jar" (
-    copy /y "%PS_ROOT%\data\android.jar" "%PROJECT_DIR%\bin\android.jar" >nul
-)
-
+if exist "%PROJECT_DIR%\bin\android.jar" del /f /q "%PROJECT_DIR%\bin\android.jar" >nul 2>&1
 if exist "%PROJECT_DIR%\bin\classes" rmdir /s /q "%PROJECT_DIR%\bin\classes"
-mkdir "%PROJECT_DIR%\bin\classes" 2>nul
-
-call :copy_classes
 
 :: update versions.txt
 if exist "%VERSIONS_FILE%" del "%VERSIONS_FILE%"
@@ -121,7 +115,7 @@ echo.
 echo   Updated versions.txt:
 call :show_selected
 echo.
-echo   Classes in bin\classes\ have been updated.
+echo   Shared classes in temp\classes\ are ready.
 echo.
 
 endlocal
